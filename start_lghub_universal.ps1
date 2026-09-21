@@ -89,6 +89,35 @@ function Get-DesktopPath {
 }
 
 # ============================================================
+# 1.5) 单实例保护
+# ============================================================
+# 计划任务（登录后自启）与用户手动双击可能同时触发。若两个实例并发，
+# 会互相抢着杀进程/启动进程，导致顺序错乱。这里用命名互斥锁确保同时只有一个实例在工作。
+# 注意：句柄必须在脚本存活期间一直持有（放在全局变量里，不要局部化）。
+$script:MutexName = 'Global\LGHUB_Ordered_Startup'
+$script:SingleInstanceMutex = $null
+$gotLock = $false
+
+try {
+    $script:SingleInstanceMutex = New-Object System.Threading.Mutex($false, $script:MutexName)
+    # 等 0 毫秒：拿不到说明已有实例在跑
+    $gotLock = $script:SingleInstanceMutex.WaitOne(0, $false)
+} catch {
+    # 创建失败（例如权限问题）时不阻断主流程，只是失去并发保护
+    $gotLock = $true
+}
+
+if (-not $gotLock) {
+    Write-Host "[跳过] 已有一个 G HUB 有序启动实例正在运行，本次不再重复执行。" -ForegroundColor Yellow
+    Write-Log "[跳过] 检测到并发实例，已退出"
+    if (-not $Silent) {
+        Write-Host "       若确实需要重跑，请等待上一个实例结束或手动结束它。" -ForegroundColor DarkGray
+        Start-Sleep -Seconds 3
+    }
+    exit 0
+}
+
+# ============================================================
 # 2) 自提权
 # ============================================================
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -96,7 +125,8 @@ if (-not $isAdmin) {
     $self = Get-SelfPath
     if (-not $self) {
         Write-Host "[错误] 无法定位脚本自身路径，请右键选择「使用 PowerShell 运行」。" -ForegroundColor Red
-        Read-Host "按回车键退出"
+        Write-Log "[错误] 无法定位脚本自身路径"
+        if (-not $Silent) { Read-Host "按回车键退出" }
         exit 1
     }
     Write-Host "[提权] 正在以管理员身份重新启动（如弹出 UAC 请点「是」）..." -ForegroundColor Yellow
@@ -109,11 +139,19 @@ if (-not $isAdmin) {
     $argList += @('-UserDesktop', ('"' + (Get-DesktopPath) + '"'))
     if ($Silent) { $argList += '-Silent' }
 
+    # 关键：提权会启动子实例（同为管理员，会尝试获取同一把锁），
+    # 必须先释放本进程持有的锁，否则子实例会以为自己被挡而直接退出。
+    if ($script:SingleInstanceMutex) {
+        try { $script:SingleInstanceMutex.ReleaseMutex() } catch { }
+    }
+
     try {
         Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs
     } catch {
         Write-Host "[失败] 提权被拒绝，请右键以管理员身份运行。" -ForegroundColor Red
-        Read-Host "按回车键退出"
+        Write-Log "[失败] 提权被拒绝"
+        if (-not $Silent) { Read-Host "按回车键退出" }
+        exit 1
     }
     exit 0
 }
@@ -561,16 +599,19 @@ if ($retryRequested) {
     if ($self) {
         $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-File', ('"' + $self + '"'))
         $argList += @('-UserDesktop', ('"' + (Get-DesktopPath) + '"'))
+        if ($script:SingleInstanceMutex) {
+            try { $script:SingleInstanceMutex.ReleaseMutex() } catch { }
+        }
         try {
             Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs
         } catch {
             Write-Host " [失败] 无法重新执行：$_" -ForegroundColor Red
             Write-Host "        请手动再运行一次本脚本。" -ForegroundColor Yellow
-            Read-Host "按回车键退出"
+            if (-not $Silent) { Read-Host "按回车键退出" }
         }
     } else {
         Write-Host " [失败] 无法定位脚本路径，请手动再运行一次。" -ForegroundColor Yellow
-        Read-Host "按回车键退出"
+        if (-not $Silent) { Read-Host "按回车键退出" }
     }
     # 当前实例直接结束，不进入下面的关窗逻辑
     exit 0
