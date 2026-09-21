@@ -40,6 +40,16 @@ lghub_agent.exe  →  lghub_updater.exe  →  lghub.exe
 | `ghub_autostart.ps1` | 自启逻辑（由上面的 cmd 调用）|
 | `README.txt` | 详细使用说明与常见问题 |
 
+## 两种启动模式
+
+| 场景 | 行为 |
+|---|---|
+| **双击桌面图标 / `Start-GHUB.cmd`** | 正常启动，G HUB 主窗口会打开 |
+| **开机自启**（计划任务，带 `-Silent`）| **静默启动**：只驻留系统托盘，不弹窗口；需要时点托盘图标即可打开主界面 |
+
+静默模式通过 `lghub_system_tray.exe --minimized` 实现，与 G HUB 自带的开机自启行为一致，
+但额外保证了 Agent → Updater 的正确启动顺序。
+
 ## 特性
 
 - **自动探测安装路径** — 默认位置 → 卸载注册表项 → 显示名模糊匹配，不写死路径与版本

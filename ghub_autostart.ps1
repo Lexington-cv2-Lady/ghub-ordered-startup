@@ -95,7 +95,13 @@ function Show-Status {
             if ($t) {
                 $d = $t.Triggers[0].Delay
                 if (-not $d) { $d = 'PT30S' }
-                Write-Host "  触发方式：登录后 $([int]($d -replace 'PT|S','')) 秒自动启动" -ForegroundColor DarkGray
+                # 用 XmlConvert 解析 ISO8601 时长，兼容 PT30S / PT1M / PT1M30S 等写法
+                $secs = try { [int][System.Xml.XmlConvert]::ToTimeSpan($d).TotalSeconds } catch { $null }
+                if ($secs -ne $null) {
+                    Write-Host "  触发方式：登录后 $secs 秒自动启动" -ForegroundColor DarkGray
+                } else {
+                    Write-Host "  触发方式：登录后 $d 自动启动" -ForegroundColor DarkGray
+                }
                 $act = $t.Actions[0].Arguments
                 if ($act -match '"?([^"\\]+\.ps1)"?') {
                     Write-Host "  执行脚本：$($Matches[1])" -ForegroundColor DarkGray

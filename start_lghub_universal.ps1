@@ -103,8 +103,11 @@ try {
     # 等 0 毫秒：拿不到说明已有实例在跑
     $gotLock = $script:SingleInstanceMutex.WaitOne(0, $false)
 } catch {
-    # 创建失败（例如权限问题）时不阻断主流程，只是失去并发保护
+    # 创建失败（例如权限受限）时不阻断主流程，但必须留痕——
+    # 否则会静默失去并发保护，两个实例并发时互相抢进程导致顺序错乱。
     $gotLock = $true
+    Write-Host "[提示] 无法建立单实例锁，本次运行没有并发保护。" -ForegroundColor DarkYellow
+    Write-Log "[提示] 互斥锁创建失败: $($_.Exception.Message)"
 }
 
 if (-not $gotLock) {
@@ -112,9 +115,11 @@ if (-not $gotLock) {
     Write-Log "[跳过] 检测到并发实例，已退出"
     if (-not $Silent) {
         Write-Host "       若确实需要重跑，请等待上一个实例结束或手动结束它。" -ForegroundColor DarkGray
-        Start-Sleep -Seconds 3
+        # 停留几秒让双击的用户能看清提示（否则窗口会立刻关闭、看起来像"什么都没发生"）
+        Start-Sleep -Seconds 6
     }
-    exit 0
+    # 退出码 2 = 因并发而跳过（区别于 0 成功、1 失败）
+    exit 2
 }
 
 # ============================================================
@@ -218,6 +223,7 @@ if (-not $root) {
 $agentExe   = Join-Path $root 'lghub_agent.exe'
 $updaterExe = Join-Path $root 'lghub_updater.exe'
 $mainExe    = Join-Path $root 'lghub.exe'
+$trayExe    = Join-Path $root 'system_tray\lghub_system_tray.exe'
 
 Write-Host "===== $AppTitle =====" -ForegroundColor White
 Write-Host "[路径] $root"
@@ -229,25 +235,50 @@ Write-Log "[路径] $root"
 # ============================================================
 $hasAgent   = Test-Path $agentExe
 $hasUpdater = Test-Path $updaterExe
+$hasTray    = Test-Path $trayExe
+
+# 最后一步启动什么：
+#   非静默           -> lghub.exe（带主窗口）
+#   静默 + 有托盘程序 -> lghub_system_tray.exe --minimized（只留托盘，不弹窗口）
+#   静默但无托盘程序  -> 降级为 lghub.exe（至少保证可用）
+$wantSilentStart = ($Silent -and $hasTray)
 
 if ($hasAgent -and $hasUpdater) {
+    $third = if ($wantSilentStart) {
+        [PSCustomObject]@{ Name='LGHUB Tray'; Exe=$trayExe; Proc='lghub_system_tray'; WaitSec=25; Args='--minimized' }
+    } else {
+        [PSCustomObject]@{ Name='LGHUB'; Exe=$mainExe; Proc='lghub'; WaitSec=25; Args='' }
+    }
+    # 步骤 2 不手动启动 updater，而是等 agent 自己把服务带起来
+    # （实测：agent 启动后约 60-280ms，SCM 会拉起 updater）。
+    # 这样 updater 是服务实例（父进程 services.exe），不会出现裸进程与服务实例并存。
     $steps = @(
-        [PSCustomObject]@{ Name='LGHUB Agent';   Exe=$agentExe;   Proc='lghub_agent';   WaitSec=12 },
-        [PSCustomObject]@{ Name='LGHUB Updater'; Exe=$updaterExe; Proc='lghub_updater'; WaitSec=10 },
-        [PSCustomObject]@{ Name='LGHUB';         Exe=$mainExe;    Proc='lghub';         WaitSec=25 }
+        [PSCustomObject]@{ Name='LGHUB Agent';   Exe=$agentExe;   Proc='lghub_agent';   WaitSec=12; Args=''; WaitFor='lghub_updater'; MaxWait=20 },
+        $third
     )
     $orderedMode = $true
-    Write-Host "[模式] 按序启动（检测到 Agent + Updater）" -ForegroundColor Cyan
+    $waitUpdater = $true
+    if ($wantSilentStart) { Write-Host "[模式] 按序启动 + 静默（先起 Agent，由它拉起 Updater，只留托盘）" -ForegroundColor Cyan }
+    else { Write-Host "[模式] 按序启动（先起 Agent，由它拉起 Updater）" -ForegroundColor Cyan }
 } else {
+    $waitUpdater = $false
     $steps = @(
-        [PSCustomObject]@{ Name='LGHUB'; Exe=$mainExe; Proc='lghub'; WaitSec=30 }
+        $(if ($wantSilentStart) {
+            [PSCustomObject]@{ Name='LGHUB Tray'; Exe=$trayExe; Proc='lghub_system_tray'; WaitSec=30; Args='--minimized' }
+        } else {
+            [PSCustomObject]@{ Name='LGHUB'; Exe=$mainExe; Proc='lghub'; WaitSec=30; Args='' }
+        })
     )
     $orderedMode = $false
+    $waitUpdater = $false
     Write-Host "[模式] 普通启动（未检测到 lghub_agent.exe，无需排序）" -ForegroundColor Cyan
 }
 
+# 注意：不包含 lghub_updater —— 它是 LGHUBUpdaterService 的进程，
+# 必须通过 Stop-Service 正常停止。若用 taskkill 强杀，会被 SCM 判定为
+# 服务异常终止并触发恢复动作（延迟重启），造成难以复现的顺序竞态。
 $killList = @(
-    'lghub_system_tray','lghub_updater','lghub_agent','lghub',
+    'lghub_system_tray','lghub_agent','lghub',
     'lghub_gl','lghub_software_manager','lghub_sso_handler',
     'lghub_gl_crashpad_handler','logi_crashpad_handler'
 )
@@ -261,22 +292,36 @@ function Test-AnyProc {
 }
 
 function Start-GHubProcess {
-    param([string]$Exe)
+    param([string]$Exe, [string]$ExtraArgs = '')
     # 必须让 G HUB 脱离本脚本的控制台。
     # 若共享控制台，脚本结束时控制台被销毁，G HUB 会收到 CTRL_CLOSE_EVENT
     # 而可能被一并结束（其 CEF 内核的日志串进本控制台，正是句柄被继承的证据）。
     # WMI 创建进程不会继承父进程的控制台句柄，因此用它启动。
+    $cmdline = '"' + $Exe + '"'
+    if ($ExtraArgs) { $cmdline += ' ' + $ExtraArgs }
     try {
         $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create `
-                -Arguments @{ CommandLine = ('"' + $Exe + '"') } -ErrorAction Stop
+                -Arguments @{ CommandLine = $cmdline } -ErrorAction Stop
         if ($r.ReturnValue -eq 0) { return $true }
-    } catch { }
-    # 兜底：普通方式启动
+        Write-Log "  [WMI] 创建进程返回非零: $($r.ReturnValue)"
+    } catch {
+        Write-Log "  [WMI] 创建进程异常: $($_.Exception.Message)"
+    }
+    # 兜底：普通方式启动。注意此法会让子进程继承本控制台，
+    # 仅在 WMI 不可用时使用，且必须校验返回值。
     try {
         $wshell = New-Object -ComObject WScript.Shell
-        $wshell.Run('"' + $Exe + '"', 1, $false) | Out-Null
+        $code = $wshell.Run($cmdline, 1, $false)
+        if ($code -ne 0) {
+            Write-Log "  [兜底] 已用 Shell 启动（返回 $code）"
+        } else {
+            Write-Log "  [兜底] Shell 启动返回 0（无法确认是否成功）"
+        }
         return $true
-    } catch { return $false }
+    } catch {
+        Write-Log "  [兜底] Shell 启动失败: $($_.Exception.Message)"
+        return $false
+    }
 }
 
 # ============================================================
@@ -285,12 +330,30 @@ function Start-GHubProcess {
 Write-Step "[1/3] 清理 G HUB 后台进程..."
 
 if ($orderedMode) {
-    # 关键：lghub_updater.exe 是 LGHUBUpdaterService 的进程。仅用 taskkill 杀它，
-    # 服务管理器会在恢复策略的 5 秒后自动拉起它，导致 Updater 早于 Agent 出现、
-    # 顺序验证失败（这正是「启动顺序 bug」的竞态来源）。
-    # 先 Stop-Service 标记为「主动停止」，就不会触发失败重启。
+    # 关键步骤：先正常停止 Updater 服务。
+    # 实测机制：lghub_agent.exe 启动时会自动拉起 LGHUBUpdaterService（服务由
+    # Stopped 变 Running，updater 进程在 agent 后约 60-280ms 出现，父进程为
+    # services.exe）。因此真正需要保证的是「启动 agent 时服务处于停止状态」——
+    # 这样才能让 agent 自己按正确顺序把服务带起来。
+    # 若服务已在运行而直接启动 agent，agent 不会重排服务，就可能出现
+    # updater 早于 agent 的顺序问题。
     Stop-Service -Name 'LGHUBUpdaterService' -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 1
+
+    # 轮询确认 updater 进程确实退出（Stop-Service 是异步的）
+    $updGone = $false
+    for ($i = 1; $i -le 15; $i++) {
+        Start-Sleep -Seconds 1
+        if (-not (Get-Process -Name 'lghub_updater' -ErrorAction SilentlyContinue)) {
+            $updGone = $true
+            Write-Host "  服务已停止，updater 进程已退出（等待 ${i} 秒）"
+            Write-Log "  服务已停止（等待 ${i} 秒）"
+            break
+        }
+    }
+    if (-not $updGone) {
+        Write-Host "  [警告] updater 进程未在 15 秒内退出，继续执行" -ForegroundColor Yellow
+        Write-Log "  [警告] updater 进程未按时退出"
+    }
 }
 
 for ($round = 1; $round -le 3; $round++) {
@@ -333,7 +396,9 @@ foreach ($s in $steps) {
         continue
     }
     Write-Host "  [启动] $($s.Name) ..."
-    if (-not (Start-GHubProcess -Exe $s.Exe)) {
+    # 记录本步骤的启动时刻，供后续顺序校验过滤掉残留/旧实例
+    $s | Add-Member -NotePropertyName LaunchedAt -NotePropertyValue (Get-Date) -Force
+    if (-not (Start-GHubProcess -Exe $s.Exe -ExtraArgs $s.Args)) {
         Write-Host "  [失败] $($s.Name) 启动异常" -ForegroundColor Red
         Write-Log "  [失败] $($s.Name) 启动异常"
         $report += [PSCustomObject]@{ Step=$s.Name; Action='启动异常'; Result='FAIL' }
@@ -345,6 +410,36 @@ foreach ($s in $steps) {
         Start-Sleep -Seconds 1
         if (Get-Process -Name $s.Proc -ErrorAction SilentlyContinue) { $ok = $true; break }
     }
+    # 某些步骤需要等待另一个进程被连带拉起（如 agent 会拉起 updater 服务）
+    if ($ok -and $s.PSObject.Properties['WaitFor'] -and $s.WaitFor) {
+        $target = $s.WaitFor
+        $maxW   = if ($s.PSObject.Properties['MaxWait']) { $s.MaxWait } else { 20 }
+        Write-Host "  [等待] 等待 $target 被拉起..." -ForegroundColor DarkGray
+        $gotIt = $false
+        for ($j = 1; $j -le $maxW; $j++) {
+            Start-Sleep -Seconds 1
+            if (Get-Process -Name $target -ErrorAction SilentlyContinue) { $gotIt = $true; break }
+        }
+        if ($gotIt) {
+            Write-Host "  [确认] $target 已由服务管理器拉起（等待 ${j} 秒）" -ForegroundColor Green
+            Write-Log "  [确认] $target 已拉起（等待 ${j} 秒）"
+        } else {
+            # 兜底：agent 未拉起服务时，主动启动服务
+            Write-Host "  [兜底] $target 未自动出现，尝试启动服务..." -ForegroundColor Yellow
+            Write-Log "  [兜底] $target 未自动出现，尝试 Start-Service"
+            Start-Service -Name 'LGHUBUpdaterService' -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+            if (Get-Process -Name $target -ErrorAction SilentlyContinue) {
+                Write-Host "  [确认] $target 已通过服务启动" -ForegroundColor Green
+                Write-Log "  [确认] $target 已通过服务启动"
+            } else {
+                Write-Host "  [超时] $target 未能启动" -ForegroundColor Red
+                Write-Log "  [超时] $target 未能启动"
+                $hasFail = $true
+            }
+        }
+    }
+
     if ($ok) {
         Write-Host "  [确认] $($s.Name) 已运行（等待 ${i} 秒）" -ForegroundColor Green
         Write-Log "  [确认] $($s.Name) 已运行（等待 ${i} 秒）"
@@ -366,46 +461,67 @@ $report | Format-Table -AutoSize | Out-Host
 Write-Step "[3/3] 校验启动顺序..."
 
 if ($orderedMode) {
-    # 重要：lghub_agent.exe 启动后会自行重启一次，瞬间可能同时存在新旧两个实例。
-    # 若此时立即取值，可能读到「正在退出的旧实例」或错过新实例，导致误判顺序。
-    # 因此先等进程稳定，再对每个进程名取其「最早」的启动时间作为该组件的真实启动时刻。
+    # 说明：agent 启动后会自行重启一次，瞬间可能同时存在新旧实例；
+    # 且若清理不彻底，也可能残留旧进程。为了只评判「本次启动」的顺序，
+    # 这里记录每个步骤的启动时刻，只采纳晚于该时刻出现的进程实例。
     Start-Sleep -Seconds 6
 
     $procs = @()
     foreach ($s in $steps) {
+        $after = $s.LaunchedAt
         $cands = @(Get-Process -Name $s.Proc -ErrorAction SilentlyContinue |
-                   Where-Object { try { $null -ne $_.StartTime } catch { $false } } |
+                   Where-Object {
+                       try {
+                           $null -ne $_.StartTime -and (
+                               -not $after -or $_.StartTime -ge $after.AddSeconds(-2)
+                           )
+                       } catch { $false }
+                   } |
                    Sort-Object StartTime)
         if ($cands.Count -gt 0) {
             $procs += [PSCustomObject]@{ Name=$s.Name; StartTime=$cands[0].StartTime; Count=$cands.Count }
         }
     }
 
-    if (@($procs).Count -eq 3) {
+    if (@($procs).Count -eq @($steps).Count) {
         $sorted = $procs | Sort-Object StartTime
         $sorted | ForEach-Object {
             $extra = if ($_.Count -gt 1) { "（共 $($_.Count) 个实例，取最早）" } else { '' }
             Write-Host ("  {0:HH:mm:ss.fff}  {1}{2}" -f $_.StartTime, $_.Name, $extra)
             Write-Log ("  进程启动时间 {0:HH:mm:ss.fff}  {1}{2}" -f $_.StartTime, $_.Name, $extra)
         }
-        $orderOk = ($sorted[0].Name -eq 'LGHUB Agent') -and ($sorted[1].Name -eq 'LGHUB Updater') -and ($sorted[2].Name -eq 'LGHUB')
+        # 动态比对：排序结果应与步骤定义顺序一致
+        $expect = ($steps | ForEach-Object { $_.Name })
+        $actual = ($sorted | ForEach-Object { $_.Name })
+        $orderOk = (($expect -join '|') -eq ($actual -join '|'))
         if ($orderOk) {
-            Write-Host "  [顺序正确] Agent -> Updater -> G HUB" -ForegroundColor Green
-            Write-Log "  [顺序正确] Agent -> Updater -> G HUB"
+            $seq = ($actual -join ' -> ')
+            Write-Host "  [顺序正确] $seq" -ForegroundColor Green
+            Write-Log "  [顺序正确] $seq"
         } else {
-            $actual = (($sorted | ForEach-Object { $_.Name }) -join ' -> ')
-            Write-Host "  [顺序异常] 实际顺序: $actual" -ForegroundColor Yellow
-            Write-Log "  [顺序异常] 实际顺序: $actual"
+            $seq = ($actual -join ' -> ')
+            Write-Host "  [顺序异常] 实际顺序: $seq" -ForegroundColor Yellow
+            Write-Log "  [顺序异常] 实际顺序: $seq"
             Write-Host "             这不一定会影响使用，若 G HUB 打不开可重跑本脚本。" -ForegroundColor DarkGray
             $hasFail = $true
         }
     } else {
-        Write-Host "  [警告] 只有 $(@($procs).Count)/3 个进程在运行，无法完整校验" -ForegroundColor Yellow
-        Write-Log "  [警告] 只有 $(@($procs).Count)/3 个进程在运行"
+        Write-Host "  [警告] 只有 $(@($procs).Count)/$(@($steps).Count) 个进程在运行，无法完整校验" -ForegroundColor Yellow
+        Write-Log "  [警告] 只有 $(@($procs).Count)/$(@($steps).Count) 个进程在运行"
+        $hasFail = $true
     }
 } else {
-    $p = Get-Process -Name 'lghub' -ErrorAction SilentlyContinue
-    if ($p) { Write-Host "  [正常] G HUB 主程序已运行" -ForegroundColor Green; Write-Log "  [正常] 主程序已运行" }
+    # 非排序模式：启动的可能是 lghub.exe（普通）或 tray（静默），两者都算成功
+    $last = $steps[-1]
+    $p = Get-Process -Name $last.Proc -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($p) {
+        Write-Host "  [正常] $($last.Name) 已运行" -ForegroundColor Green
+        Write-Log "  [正常] $($last.Name) 已运行"
+    } else {
+        Write-Host "  [警告] 未检测到 $($last.Name) 进程" -ForegroundColor Yellow
+        Write-Log "  [警告] 未检测到 $($last.Name)"
+        $hasFail = $true
+    }
 }
 
 # ============================================================
@@ -415,7 +531,6 @@ $selfPath  = Get-SelfPath
 $scriptDir = if ($selfPath) { Split-Path $selfPath -Parent } else { $PWD.Path }
 $markerDir = Join-Path $env:LOCALAPPDATA 'LGHUBOrderStart'
 $marker    = Join-Path $markerDir 'firstrun.done'
-$asked     = $false
 $hadPrompt = $false
 
 function Test-FirstRun {
@@ -626,3 +741,13 @@ if ($retryRequested) {
 #   · 在已有终端里运行时，窗口属于用户自己的终端，本就不应关闭
 # 之前用 GetConsoleProcessList 判断"是否共享控制台"再决定杀不杀，
 # 反而因为启动器会额外引入一个 cmd 进程而误判，故弃用。
+
+# ============================================================
+# 12) 退出码
+# ============================================================
+# 供计划任务/上层脚本判断结果：
+#   0 = 成功（顺序校验通过，或非排序模式下目标进程已运行）
+#   1 = 失败（有步骤未完成，或顺序校验不通过）
+# 注意：$Silent 无人值守运行时，这个退出码是唯一能被外部感知的信号。
+if ($hasFail) { exit 1 }
+exit 0
